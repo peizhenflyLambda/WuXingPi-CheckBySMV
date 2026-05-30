@@ -1,0 +1,236 @@
+-- ============================================================
+-- WuXing-π Model Checking with NuSMV (Version 2.0 - Fixed)
+-- Removed tau_choice; uses direct non-deterministic transitions.
+-- ============================================================
+
+MODULE main
+
+VAR
+  -- Shared channels
+  s_SI : {empty, token};
+  s_IE : {empty, task};
+  s_EA : {empty, result};
+  s_AV : {empty, aggregate};
+  s_VS : {empty, rule, new_rule};
+  k_IA : {empty, slow};
+  k_AS : {empty, override};
+  k_SE : {empty, cooldown, cooldown_prime, stop};
+  k_EV : {empty, outdated};
+  k_VI : {empty, rejection};
+
+  bootstrap_done : boolean;
+
+  initiator  : Initiator(s_SI, s_IE, k_IA, k_VI);
+  executor   : Executor(s_IE, s_EA, k_SE, k_EV);
+  aggregator : Aggregator(s_EA, k_IA, s_AV, k_AS);
+  validator  : Validator(s_AV, k_EV, s_VS, k_VI);
+  scheduler  : Scheduler(s_VS, k_AS, s_SI, k_SE, bootstrap_done);
+-- Fairness tracking flags
+  initiator_fair : boolean;
+  executor_fair  : boolean;
+
+ASSIGN
+  init(initiator_fair) := FALSE;
+  next(initiator_fair) := (initiator.state = active & next(initiator.state) = pending);
+  init(executor_fair)  := FALSE;
+  next(executor_fair)  := (executor.state = cooled & next(executor.state) = cooled);
+
+DEFINE
+  deadlock :=
+    (initiator.state = dormant | initiator.state = pending) &
+    executor.state = idle &
+    aggregator.n = 0 &
+    validator.state = idle &
+    scheduler.state = idle &
+    s_SI = empty & s_IE = empty & s_EA = empty &
+    s_AV = empty & s_VS = empty &
+    k_IA = empty & k_AS = empty & k_SE = empty &
+    k_EV = empty & k_VI = empty &
+    bootstrap_done = TRUE;
+
+
+-- ============================================================
+-- Fairness constraints (eliminate unfair infinite postponement)
+-- ============================================================
+JUSTICE initiator_fair;
+JUSTICE executor_fair;
+
+
+-- ============================================================
+-- CTL Specifications (Conditional Liveness, Fairness Constrained)
+-- ============================================================
+
+-- 1. Deadlock freedom under fairness
+SPEC AG !deadlock
+
+-- 2. Executor self-healing
+SPEC AG (executor.state = active -> AF (executor.state = idle | deadlock))
+
+-- 3. Initiator flooding recovery
+SPEC AG (initiator.state = active -> AF (initiator.state = dormant | deadlock))
+
+-- 4. Validator rigidity recovery: by either Ke (reforge) or Sheng (eval)
+SPEC AG ((validator.state = idle & executor.state = cooled) -> AF (validator.state = reforge | validator.state = eval | deadlock))
+
+-- 5. Scheduler disorder recovery (override)
+SPEC AG ((scheduler.state = idle & aggregator.n > 10) -> AF (scheduler.state = dispatch_prime | deadlock))
+
+-- 6. Aggregator overload recovery
+SPEC AG (aggregator.n > 0 -> AF (aggregator.n = 0 | deadlock))
+
+-- 7. Stable configuration reachable
+SPEC EF (initiator.state = dormant & executor.state = idle & aggregator.n = 0 & validator.state = idle & scheduler.state = idle)
+
+
+-- ============================================================
+-- MODULE: Initiator (Wood)
+-- ============================================================
+MODULE Initiator(s_SI, s_IE, k_IA, k_VI)
+VAR
+  state : {dormant, active, pending};
+ASSIGN
+  init(state) := dormant;
+
+  next(state) := case
+    state = dormant & s_SI = token    : active;
+    state = dormant & k_VI = rejection : dormant;
+    state = active                     : {pending, active};  -- τ: send task → pending, or send slow → stay active
+    state = active & k_VI = rejection  : dormant;
+    state = pending & k_VI = rejection : dormant;
+    TRUE                               : state;
+  esac;
+
+  next(s_IE) := case
+    state = active & next(state) = pending : task;
+    TRUE                                   : empty;
+  esac;
+
+  next(k_IA) := case
+    state = active & next(state) = active : slow;
+    TRUE                                  : empty;
+  esac;
+
+
+-- ============================================================
+-- MODULE: Executor (Fire)
+-- ============================================================
+MODULE Executor(s_IE, s_EA, k_SE, k_EV)
+VAR
+  state : {idle, active, cooled};
+ASSIGN
+  init(state) := idle;
+
+  next(state) := case
+    state = idle & s_IE = task                                         : active;
+    state = idle & (k_SE = stop | k_SE = cooldown | k_SE = cooldown_prime) : cooled;
+    state = active                                                      : idle;   -- τ: normal finish
+    state = active & (k_SE = stop | k_SE = cooldown | k_SE = cooldown_prime) : cooled;
+    state = cooled                                                      : {idle, cooled}; -- τ: recover or send k_EV
+    state = cooled & (k_SE = stop | k_SE = cooldown | k_SE = cooldown_prime) : cooled;
+    TRUE                                                                : state;
+  esac;
+
+  next(s_EA) := case
+    state = active : result;
+    TRUE           : empty;
+  esac;
+
+  next(k_EV) := case
+    state = cooled & next(state) = cooled : outdated; -- τ chose send k_EV
+    TRUE                                  : empty;
+  esac;
+
+
+-- ============================================================
+-- MODULE: Aggregator (Earth)
+-- ============================================================
+MODULE Aggregator(s_EA, k_IA, s_AV, k_AS)
+VAR
+  n : 0..12;
+ASSIGN
+  init(n) := 0;
+
+  next(n) := case
+    s_EA = result & n < 12  : n + 1;
+    k_IA = slow             : 0;
+    n > 0                   : 0;   -- τ: send s_AV and reset
+    n > 10                  : n;   -- τ: send k_AS (keep n)
+    TRUE                    : n;
+  esac;
+
+  next(s_AV) := case
+    n > 0 : aggregate;
+    TRUE  : empty;
+  esac;
+
+  next(k_AS) := case
+    n > 10 : override;
+    TRUE   : empty;
+  esac;
+
+
+-- ============================================================
+-- MODULE: Validator (Metal)
+-- ============================================================
+MODULE Validator(s_AV, k_EV, s_VS, k_VI)
+VAR
+  state : {idle, eval, reforge};
+ASSIGN
+  init(state) := idle;
+
+  next(state) := case
+    state = idle & s_AV = aggregate   : eval;
+    state = idle & k_EV = outdated    : reforge;
+    state = eval                      : {idle, idle};   -- τ: send rule → idle, or send rejection → idle (both to idle)
+    state = eval & k_EV = outdated    : reforge;
+    state = reforge                   : idle;           -- τ: send new_rule → idle
+    state = reforge & k_EV = outdated : reforge;
+    TRUE                              : state;
+  esac;
+
+  next(s_VS) := case
+    state = eval & next(state) = idle    : {rule, empty};  -- non-det: maybe rule
+    state = reforge                      : new_rule;
+    TRUE                                 : empty;
+  esac;
+
+  next(k_VI) := case
+    state = eval & next(state) = idle & s_VS != rule : rejection; -- if not sending rule, send rejection
+    TRUE                                             : empty;
+  esac;
+
+
+-- ============================================================
+-- MODULE: Scheduler (Water)
+-- ============================================================
+MODULE Scheduler(s_VS, k_AS, s_SI, k_SE, bootstrap_done)
+VAR
+  state : {idle, dispatch, dispatch_prime};
+ASSIGN
+  init(state) := idle;
+
+  next(state) := case
+    state = idle & (s_VS = rule | s_VS = new_rule) : dispatch;
+    state = idle & k_AS = override                 : dispatch_prime;
+    state = dispatch                                : idle;   -- τ: spawn outputs and return
+    state = dispatch_prime                          : idle;
+    TRUE                                           : state;
+  esac;
+
+  next(k_SE) := case
+    state = dispatch        : cooldown;
+    state = dispatch_prime  : cooldown_prime;
+    TRUE                   : empty;
+  esac;
+
+  next(s_SI) := case
+    state = dispatch        : token;
+    state = dispatch_prime  : token;
+    !bootstrap_done         : token;
+    TRUE                    : empty;
+  esac;
+
+  next(bootstrap_done) := case
+    !bootstrap_done : TRUE;
+    TRUE            : bootstrap_done;
+  esac;
